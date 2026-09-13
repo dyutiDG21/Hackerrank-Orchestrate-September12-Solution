@@ -314,7 +314,22 @@ def apply_evidence_to_event(
                 reason=reason,
             )
 
-    date_claims = [claim for claim in sorted_claims if claim.effective_date is not None and claim.claim_type in {"date_confirmation", "date_amendment", "status_confirmation", "amount_amendment"}]
+    # A receipt/order/document date is evidence about the document, not by itself
+    # an amendment to an already known cash-settlement date.  Only an explicit
+    # amendment, or a financial-status/amount amendment, can change that date.
+    date_claims = [
+        claim
+        for claim in sorted_claims
+        if claim.effective_date is not None
+        and (
+            claim.claim_type in {"date_amendment", "amount_amendment"}
+            or (
+                claim.claim_type == "status_confirmation"
+                and claim.status is not None
+                and canonical_cash_status(claim.status) is not None
+            )
+        )
+    ]
     if date_claims:
         claim = date_claims[-1]
         field = "settlement_date" if current.settlement_date is not None else "event_date"
@@ -341,7 +356,11 @@ def apply_evidence_to_event(
                 rule=rule,
                 reason=reason,
             )
-            if amount_claim.currency is not None:
+            # A confirmation can establish a missing amount, but a receipt label
+            # such as "Rs." is not necessarily an explicit amendment of the
+            # event's already-known monetary currency.  Preserve that currency
+            # unless the evidence itself is an amount amendment.
+            if amount_claim.currency is not None and amount_claim.claim_type == "amount_amendment":
                 current = apply_field_update(
                     current,
                     traces,

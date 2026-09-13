@@ -286,6 +286,53 @@ class FinancialStateResolutionTests(unittest.TestCase):
         self.assertEqual(normalized.conversion.rate, Decimal("3"))
         self.assertEqual(normalized.home_amount, Decimal("60"))
 
+    def test_document_date_confirmation_does_not_replace_known_cash_settlement_date(self) -> None:
+        base = event(
+            "event_1",
+            amount=None,
+            currency="EUR",
+            event_date=date(2026, 1, 1),
+            settlement_date=date(2026, 1, 1),
+            status="settled",
+            direction="debit",
+        )
+        receipt_date = claim(
+            "receipt_date",
+            claim_type="date_confirmation",
+            amount=None,
+            currency=None,
+            effective_date=date(2026, 1, 2),
+            source_id="image_receipt",
+        )
+        amount_claim = claim(
+            "receipt_amount",
+            claim_type="amount_confirmation",
+            amount=Decimal("40"),
+            currency="EUR",
+            effective_date=date(2026, 1, 2),
+            source_id="image_receipt",
+        )
+        state = resolve_financial_state(dataset_with((base,)), (receipt_date, amount_claim))
+        resolved = state.by_event_id["event_1"]
+        self.assertEqual(resolved.resolved_event.settlement_date, date(2026, 1, 1))
+        self.assertEqual(resolved.normalized_event.conversion.rate_date, date(2026, 1, 1))
+        self.assertEqual(resolved.normalized_event.home_amount, Decimal("80"))
+
+    def test_amount_confirmation_preserves_known_event_currency(self) -> None:
+        base = event("event_1", amount=None, currency="EUR", status="settled", direction="debit")
+        receipt_amount = claim(
+            "receipt_amount",
+            claim_type="amount_confirmation",
+            amount=Decimal("40"),
+            currency="Rs.",
+            source_id="image_receipt",
+        )
+        state = resolve_financial_state(dataset_with((base,)), (receipt_amount,))
+        resolved = state.by_event_id["event_1"]
+        self.assertEqual(resolved.resolved_event.amount, Decimal("40"))
+        self.assertEqual(resolved.resolved_event.currency, "EUR")
+        self.assertEqual(resolved.normalized_event.home_amount, Decimal("80"))
+
     def test_derived_cash_flow_flags_recomputed_after_status_change(self) -> None:
         base = event("event_1", amount=Decimal("100"), status="pending", direction="debit")
         cancel = claim("cancel", claim_type="cancellation", amount=None, currency=None, status="cancelled")
