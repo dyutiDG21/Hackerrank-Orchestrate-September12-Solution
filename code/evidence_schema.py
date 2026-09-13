@@ -144,8 +144,13 @@ def parse_optional_decimal(value: Any, field: str) -> Decimal | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        raise EvidenceValidationError(f"{field} must be a decimal-compatible value or null")
-    return parse_decimal(str(value), field=field)
+        raise ClaimValidationError(f"{field} must be a decimal-compatible value or null")
+    try:
+        return parse_decimal(str(value), field=field)
+    except DataValidationError as exc:
+        # Provider values such as percentages are not monetary Decimal values.
+        # Reject just this claim so valid siblings can still be cached and used.
+        raise ClaimValidationError(f"{field} is not a valid monetary decimal") from exc
 
 
 def parse_optional_date(value: Any, field: str) -> date | None:

@@ -508,7 +508,7 @@ class EvidenceExtractionTests(unittest.TestCase):
                 related_event_id=None,
             )
 
-    def test_amount_without_currency_claim_is_dropped(self) -> None:
+    def test_invalid_percent_amount_is_dropped_while_valid_sibling_is_preserved(self) -> None:
         result = validate_evidence_response(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -517,8 +517,8 @@ class EvidenceExtractionTests(unittest.TestCase):
                         "claim_id": "percent_only",
                         "claim_type": "amount_amendment",
                         "document_role": None,
-                        "amount": "12",
-                        "currency": None,
+                        "amount": "12%",
+                        "currency": "USD",
                         "effective_date": None,
                         "status": None,
                         "identifier_role": None,
@@ -547,6 +547,43 @@ class EvidenceExtractionTests(unittest.TestCase):
         )
         self.assertEqual([claim.claim_id for claim in result.claims], ["date_valid"])
         self.assertIsNone(result.claims[0].amount)
+
+    def test_invalid_amount_claim_is_not_cached_but_valid_siblings_and_usage_are_preserved(self) -> None:
+        message = self.dataset.indexes.messages_by_message_id["message_01"]
+        fake = FakeEvidenceClient(
+            [
+                response_with_claims(
+                    [
+                        {
+                            "claim_id": "invalid_percent",
+                            "claim_type": "amount_amendment",
+                            "amount": "12%",
+                            "currency": "IDR",
+                            "effective_date": None,
+                            "status": None,
+                            "referenced_external_id": None,
+                            "provenance": "Source contains a percentage, not a money amount.",
+                        },
+                        {
+                            "claim_id": "valid_decimal",
+                            "claim_type": "amount_confirmation",
+                            "amount": "42750000.20",
+                            "currency": "IDR",
+                            "effective_date": "2025-08-15",
+                            "status": None,
+                            "referenced_external_id": None,
+                            "provenance": "Source confirms a monetary amount.",
+                        },
+                    ]
+                )
+            ]
+        )
+        usage = UsageTracker()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = EvidenceExtractionConfig(cache_dir=Path(tmp))
+            result = extract_message_evidence(message, client=fake, config=config, cache=EvidenceCache(tmp), usage_tracker=usage)
+        self.assertEqual([(claim.claim_id, claim.amount) for claim in result.claims], [("valid_decimal", Decimal("42750000.20"))])
+        self.assertEqual(usage.totals(), {"calls": 1, "input_tokens": 123, "output_tokens": 45, "cached_input_tokens": 10})
 
     def test_usage_recorded_when_response_validation_fails(self) -> None:
         message = self.dataset.indexes.messages_by_message_id["message_01"]
