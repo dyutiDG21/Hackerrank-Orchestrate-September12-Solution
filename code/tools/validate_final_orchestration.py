@@ -13,7 +13,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from data_layer import load_dataset
-from main import evaluation_scope, validate_output
+from main import estimate_runtime_cost, evaluation_scope, validate_output
 from recommendation_selection import FinalDecision
 
 
@@ -81,6 +81,10 @@ class FinalOrchestrationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "conflicting spending change"):
             validate_output(self.dataset, self.all_fallbacks(decision))
+
+    def test_documented_runtime_cost_uses_decimal_rates(self) -> None:
+        totals = {"calls": 1, "input_tokens": 1_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        self.assertEqual(estimate_runtime_cost(totals), Decimal("14.20"))
 
 
 if __name__ == "__main__":

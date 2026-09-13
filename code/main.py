@@ -134,18 +134,41 @@ def _is_positive_decimal(value: str) -> bool:
         return False
 
 
+def estimate_runtime_cost(totals: dict[str, int]) -> Decimal:
+    """Use the documented GPT-5.6 Terra standard rates with Decimal arithmetic."""
+    million = Decimal("1000000")
+    return (
+        Decimal(totals["input_tokens"]) * Decimal("2.00") / million
+        + Decimal(totals["cached_input_tokens"]) * Decimal("0.20") / million
+        + Decimal(totals["output_tokens"]) * Decimal("12.00") / million
+    )
+
+
 def write_usage_report(path: Path, *, model: str, usage: UsageTracker, message_hits: int, image_hits: int, message_filled: int, image_filled: int, request_count: int) -> None:
-    totals = usage.totals(); total_tokens = totals["input_tokens"] + totals["output_tokens"]
+    totals = usage.totals()
+    total_tokens = totals["input_tokens"] + totals["output_tokens"]
+    current_cost = estimate_runtime_cost(totals)
+    historical_cache_entries = message_hits + image_hits
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "# Runtime Usage Report\n\n"
+        "## Final Orchestration Pass\n\n"
         f"- Provider: OpenAI Responses API\n- Model: `{model}`\n"
-        f"- Model calls: {totals['calls']}\n- Input tokens: {totals['input_tokens']}\n"
-        f"- Cached input tokens: {totals['cached_input_tokens']}\n- Output tokens: {totals['output_tokens']}\n"
-        f"- Total tokens: {total_tokens}\n- Average tokens per evaluation request: {Decimal(total_tokens) / Decimal(request_count)}\n"
-        f"- Evidence cache hits reused: {message_hits + image_hits}\n- Evidence cache misses filled this run: {message_filled + image_filled}\n"
-        "- Estimated model cost: unavailable. The repository contains no trustworthy pricing metadata; no price was guessed.\n"
-        "- Estimated cost per evaluation request: unavailable for the same reason.\n\n"
+        f"- New model calls: {totals['calls']}\n- New input tokens: {totals['input_tokens']}\n"
+        f"- New cached input tokens: {totals['cached_input_tokens']}\n- New output tokens: {totals['output_tokens']}\n"
+        f"- New total tokens: {total_tokens}\n- New average tokens per evaluation request: {Decimal(total_tokens) / Decimal(request_count)}\n"
+        f"- New estimated runtime cost: ${current_cost:.8f}\n"
+        f"- New estimated cost per evaluation request: ${current_cost / Decimal(request_count):.8f}\n"
+        f"- Evidence cache entries reused: {historical_cache_entries}\n- Evidence cache misses filled this pass: {message_filled + image_filled}\n\n"
+        "## Historical Evidence Represented By The Final Output\n\n"
+        f"- Cached evaluation-relevant sources: {historical_cache_entries} ({message_hits} messages, {image_hits} images)\n"
+        f"- Provider calls represented: {historical_cache_entries}; the extraction pipeline performs one Responses API call per source cache miss.\n"
+        "- Historical input tokens: unavailable; cache payloads retain validated claims only, not provider usage.\n"
+        "- Historical cached input tokens: unavailable; not persisted in cache or local usage metadata.\n"
+        "- Historical output tokens: unavailable; not persisted in cache or local usage metadata.\n"
+        "- Historical total tokens and average per evaluation request: unavailable because the component token counts cannot be reconstructed.\n"
+        "- Historical estimated runtime cost and per-evaluation-request cost: unavailable because token usage cannot be reconstructed.\n\n"
+        "Cost formula when usage is available: input_tokens * $2.00/1M + cached_input_tokens * $0.20/1M + output_tokens * $12.00/1M.\n"
         "This report covers solution runtime evidence extraction only, not Codex development usage.\n",
         encoding="utf-8", newline="\n",
     )
