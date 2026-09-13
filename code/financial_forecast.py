@@ -92,6 +92,7 @@ class ForecastResult:
     blockers: tuple[ForecastBlocker, ...]
     notices: tuple[ForecastNotice, ...]
     diagnostics: ForecastDiagnostics
+    scenario_adjustments: tuple["ScenarioAdjustmentTrace", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,25 @@ class HypotheticalMovement:
     direction: str = "debit"
     description: str = "hypothetical payment"
     provenance: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScenarioDebitAdjustment:
+    """A scenario-only change to future projected debits from one event source."""
+
+    action: str
+    event_id: str
+    new_amount: Decimal | None = None
+    reduced_home_amounts: tuple[tuple[str, Decimal], ...] = ()
+    provenance: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScenarioAdjustmentTrace:
+    action: str
+    event_id: str
+    affected_movement_ids: tuple[str, ...]
+    provenance: tuple[str, ...]
 
 
 def signed_amount(amount: Decimal, direction: str) -> Decimal:
@@ -156,6 +176,7 @@ def compute_checkpoints(
     blockers: tuple[ForecastBlocker, ...],
     diagnostics: ForecastDiagnostics,
     notices: tuple[ForecastNotice, ...] = (),
+    scenario_adjustments: tuple[ScenarioAdjustmentTrace, ...] = (),
 ) -> ForecastResult:
     ordered_movements = tuple(sorted(movements, key=movement_sort_key))
     checkpoints: list[ForecastCheckpoint] = [
@@ -187,6 +208,7 @@ def compute_checkpoints(
         blockers=tuple(sorted(blockers, key=lambda item: (item.date or date.min, item.source_type, item.source_id, item.reason))),
         notices=tuple(sorted(notices, key=lambda item: (item.date or date.min, item.source_type, item.source_id, item.reason))),
         diagnostics=diagnostics,
+        scenario_adjustments=scenario_adjustments,
     )
 
 
@@ -575,10 +597,80 @@ def build_forecast(
     )
 
 
+def validate_scenario_adjustments(adjustments: tuple[ScenarioDebitAdjustment, ...]) -> None:
+    if len(adjustments) > 3:
+        raise ValueError("A scenario may contain at most three spending adjustments")
+    event_ids = [item.event_id for item in adjustments]
+    if len(set(event_ids)) != len(event_ids):
+        raise ValueError("A scenario cannot stop and reduce the same event")
+    for item in adjustments:
+        if item.action == "stop" and item.new_amount is not None:
+            raise ValueError("Stop adjustments cannot have a replacement amount")
+        if item.action == "reduce_to" and (item.new_amount is None or item.new_amount < Decimal("0")):
+            raise ValueError("Reduce adjustments require a non-negative Decimal replacement amount")
+        if item.action not in {"stop", "reduce_to"}:
+            raise ValueError(f"Unsupported scenario adjustment action: {item.action!r}")
+
+
+def apply_scenario_adjustments(
+    baseline: ForecastResult,
+    adjustments: tuple[ScenarioDebitAdjustment, ...],
+) -> tuple[tuple[ForecastMovement, ...], tuple[ScenarioAdjustmentTrace, ...]]:
+    """Return a scenario copy with only matching projected debit movements changed."""
+    validate_scenario_adjustments(adjustments)
+    by_event_id = {item.event_id: item for item in adjustments}
+    adjusted: list[ForecastMovement] = []
+    affected: dict[str, list[str]] = {item.event_id: [] for item in adjustments}
+
+    for movement in baseline.movements:
+        matches = [
+            adjustment
+            for event_id, adjustment in by_event_id.items()
+            if event_id in movement.provenance
+            and movement.source == "recurrence_projection"
+            and movement.direction == "debit"
+        ]
+        if not matches:
+            adjusted.append(movement)
+            continue
+        if len(matches) != 1:
+            raise ValueError("Multiple scenario adjustments matched one projected debit movement")
+        adjustment = matches[0]
+        affected[adjustment.event_id].append(movement.movement_id)
+        if adjustment.action == "stop":
+            continue
+
+        home_amounts = dict(adjustment.reduced_home_amounts)
+        replacement = home_amounts.get(movement.movement_id, adjustment.new_amount)
+        if replacement is None:
+            raise ValueError(f"Reduction for {adjustment.event_id!r} has no replacement amount")
+        adjusted.append(
+            replace(
+                movement,
+                amount=replacement,
+                signed_amount=signed_amount(replacement, "debit"),
+                provenance=movement.provenance + (f"scenario_adjustment:{adjustment.action}:{adjustment.event_id}",),
+                description=f"{movement.description} adjusted by {adjustment.action}:{adjustment.event_id}",
+            )
+        )
+
+    traces = tuple(
+        ScenarioAdjustmentTrace(
+            action=item.action,
+            event_id=item.event_id,
+            affected_movement_ids=tuple(affected[item.event_id]),
+            provenance=item.provenance,
+        )
+        for item in adjustments
+    )
+    return tuple(adjusted), traces
+
+
 def build_scenario_forecast(
     baseline: ForecastResult,
     *,
     hypothetical_movements: tuple[HypotheticalMovement, ...],
+    scenario_adjustments: tuple[ScenarioDebitAdjustment, ...] = (),
 ) -> ForecastResult:
     hypotheticals = tuple(
         hypothetical_to_movement(baseline.user_id, baseline.home_currency, item)
@@ -589,6 +681,7 @@ def build_scenario_forecast(
         baseline.diagnostics,
         hypothetical_movements_included=len(hypotheticals),
     )
+    adjusted_movements, adjustment_traces = apply_scenario_adjustments(baseline, scenario_adjustments)
     return compute_checkpoints(
         user_id=baseline.user_id,
         home_currency=baseline.home_currency,
@@ -596,10 +689,11 @@ def build_scenario_forecast(
         end_date=baseline.end_date,
         starting_balance=baseline.starting_balance,
         minimum_balance_to_keep=baseline.minimum_balance_to_keep,
-        movements=baseline.movements + hypotheticals,
+        movements=adjusted_movements + hypotheticals,
         blockers=baseline.blockers,
         notices=baseline.notices,
         diagnostics=diagnostics,
+        scenario_adjustments=adjustment_traces,
     )
 
 

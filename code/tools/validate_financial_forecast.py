@@ -26,6 +26,7 @@ from evidence_extraction import (  # noqa: E402
 from evidence_schema import EvidenceClaim  # noqa: E402
 from financial_forecast import (  # noqa: E402
     HypotheticalMovement,
+    ScenarioDebitAdjustment,
     build_forecast,
     build_scenario_forecast,
     forecast_diagnostics,
@@ -378,6 +379,52 @@ class FinancialForecastTests(unittest.TestCase):
         )
         self.assertEqual(baseline, original)
         self.assertEqual(len(baseline.movements), 0)
+
+    def test_stop_adjustment_suppresses_only_matching_projected_debits(self) -> None:
+        baseline = forecast_for((
+            event("rent_1", event_date=date(2026, 1, 1), description="Flexible rent", flexibility="stoppable"),
+            event("rent_2", event_date=date(2026, 2, 1), description="Flexible rent", flexibility="stoppable"),
+            event("rent_3", event_date=date(2026, 3, 1), description="Flexible rent", flexibility="stoppable"),
+            event("one_off", event_date=date(2026, 4, 2), description="Unrelated"),
+        ), start=date(2026, 4, 1), horizon_days=31)
+        original = baseline
+        scenario = build_scenario_forecast(
+            baseline,
+            hypothetical_movements=(),
+            scenario_adjustments=(ScenarioDebitAdjustment("stop", "rent_3", provenance=("rent_3",)),),
+        )
+        self.assertEqual(baseline, original)
+        self.assertEqual([movement.source_id for movement in scenario.movements], ["one_off"])
+        self.assertEqual(len(scenario.scenario_adjustments[0].affected_movement_ids), 2)
+
+    def test_reduce_adjustment_replaces_projected_amount_once_and_keeps_history(self) -> None:
+        baseline = forecast_for((
+            event("fee_1", amount=Decimal("100"), event_date=date(2026, 1, 1), description="Flexible fee", flexibility="reducible"),
+            event("fee_2", amount=Decimal("100"), event_date=date(2026, 2, 1), description="Flexible fee", flexibility="reducible"),
+            event("fee_3", amount=Decimal("100"), event_date=date(2026, 3, 1), description="Flexible fee", flexibility="reducible"),
+            event("one_off", amount=Decimal("25"), event_date=date(2026, 4, 2), description="Unrelated"),
+        ), start=date(2026, 4, 1), horizon_days=31)
+        scenario = build_scenario_forecast(
+            baseline,
+            hypothetical_movements=(),
+            scenario_adjustments=(ScenarioDebitAdjustment("reduce_to", "fee_3", Decimal("40")),),
+        )
+        projected = [movement for movement in scenario.movements if movement.source == "recurrence_projection"]
+        explicit = [movement for movement in scenario.movements if movement.source == "explicit_event"]
+        self.assertEqual([movement.amount for movement in projected], [Decimal("40"), Decimal("40")])
+        self.assertEqual(explicit[0].amount, Decimal("25"))
+        self.assertTrue(all(movement.provenance.count("scenario_adjustment:reduce_to:fee_3") == 1 for movement in projected))
+
+    def test_invalid_adjustment_combinations_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_scenario_forecast(
+                forecast_for(()),
+                hypothetical_movements=(),
+                scenario_adjustments=(
+                    ScenarioDebitAdjustment("stop", "event_1"),
+                    ScenarioDebitAdjustment("reduce_to", "event_1", Decimal("1")),
+                ),
+            )
 
     def test_decimal_preservation(self) -> None:
         result = forecast_for((event("event_1", amount=Decimal("0.10"), event_date=date(2026, 1, 1)),))

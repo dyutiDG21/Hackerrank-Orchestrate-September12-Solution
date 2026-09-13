@@ -15,7 +15,13 @@ from decimal import Decimal
 from itertools import combinations
 
 from data_layer import Dataset, FinancialEvent, PaymentOption, PurchaseRequest
-from financial_forecast import ForecastResult, HypotheticalMovement, build_scenario_forecast
+from event_normalization import MissingExchangeRateError, convert_currency
+from financial_forecast import (
+    ForecastResult,
+    HypotheticalMovement,
+    ScenarioDebitAdjustment,
+    build_scenario_forecast,
+)
 from payment_capacity import PaymentCapacityResult
 from recurrence_inference import RecurringSeries
 
@@ -127,19 +133,12 @@ def eligible_spending_changes(
     request: PurchaseRequest,
     recurring_series: tuple[RecurringSeries, ...],
 ) -> tuple[SpendingChange, ...]:
-    """Return allowable recurring-event actions; L3 cannot yet validate them.
-
-    Only events participating in projectable recurrence are eligible. This
-    prevents a one-off flexible purchase from becoming a fabricated ongoing
-    saving. The returned actions retain their event provenance for a later L3
-    scenario API that can suppress or amend an existing forecast movement.
-    """
+    """Return allowable actions for one canonical source event per series."""
     profile = dataset.indexes.profiles_by_user_id[request.user_id]
     recurring_event_ids = {
-        event_id
+        series.member_event_ids[-1]
         for series in recurring_series
         if series.projectable and series.grouping_key.user_id == request.user_id and series.grouping_key.direction == "debit"
-        for event_id in series.member_event_ids
     }
     changes: list[SpendingChange] = []
     for event_id in sorted(recurring_event_ids):
@@ -166,7 +165,7 @@ def eligible_spending_changes(
 
 
 def bounded_change_sets(changes: tuple[SpendingChange, ...]) -> tuple[tuple[SpendingChange, ...], ...]:
-    """Deterministically enumerate non-conflicting change sets for later L3 support."""
+    """Deterministically enumerate non-conflicting scenario change sets."""
     results: list[tuple[SpendingChange, ...]] = [()]
     for length in range(1, MAX_SPENDING_CHANGES + 1):
         for candidate in combinations(changes, length):
@@ -178,11 +177,63 @@ def bounded_change_sets(changes: tuple[SpendingChange, ...]) -> tuple[tuple[Spen
     return tuple(results)
 
 
+def bind_scenario_adjustments(
+    dataset: Dataset,
+    baseline: ForecastResult,
+    changes: tuple[SpendingChange, ...],
+) -> tuple[ScenarioDebitAdjustment, ...] | None:
+    """Bind a source-currency reduction to exact dated home-currency movements."""
+    _validate_changes(changes)
+    profile = dataset.indexes.profiles_by_user_id[baseline.user_id]
+    adjustments: list[ScenarioDebitAdjustment] = []
+    for change in changes:
+        event = dataset.indexes.events_by_event_id[change.event_id]
+        matching = tuple(
+            movement
+            for movement in baseline.movements
+            if movement.source == "recurrence_projection"
+            and movement.direction == "debit"
+            and change.event_id in movement.provenance
+        )
+        if not matching:
+            return None
+        home_amounts: list[tuple[str, Decimal]] = []
+        if change.action == "reduce_to":
+            assert change.new_amount is not None
+            try:
+                home_amounts = [
+                    (
+                        movement.movement_id,
+                        convert_currency(
+                            change.new_amount,
+                            event.currency,
+                            profile.home_currency,
+                            movement.date,
+                            dataset,
+                        ).converted_amount,
+                    )
+                    for movement in matching
+                ]
+            except MissingExchangeRateError:
+                return None
+        adjustments.append(
+            ScenarioDebitAdjustment(
+                action=change.action,
+                event_id=change.event_id,
+                new_amount=change.new_amount,
+                reduced_home_amounts=tuple(home_amounts),
+                provenance=change.provenance,
+            )
+        )
+    return tuple(adjustments)
+
+
 def _scenario_for_legs(
     baseline: ForecastResult,
     *,
     candidate_id: str,
     legs: tuple[PaymentLeg, ...],
+    scenario_adjustments: tuple[ScenarioDebitAdjustment, ...] = (),
 ) -> tuple[ForecastResult, int]:
     movements = tuple(
         HypotheticalMovement(
@@ -196,7 +247,11 @@ def _scenario_for_legs(
         for index, leg in enumerate(legs)
     )
     excluded = sum(1 for movement in movements if not (baseline.start_date <= movement.date <= baseline.end_date))
-    return build_scenario_forecast(baseline, hypothetical_movements=movements), excluded
+    return build_scenario_forecast(
+        baseline,
+        hypothetical_movements=movements,
+        scenario_adjustments=scenario_adjustments,
+    ), excluded
 
 
 def _safe_candidate(
@@ -208,16 +263,24 @@ def _safe_candidate(
     payment_option_id: str | None,
     baseline: ForecastResult,
     traces: tuple[PlanTrace, ...],
+    spending_changes: tuple[SpendingChange, ...] = (),
+    scenario_adjustments: tuple[ScenarioDebitAdjustment, ...] = (),
 ) -> PlanCandidate | None:
     _validate_legs(legs)
-    scenario, excluded = _scenario_for_legs(baseline, candidate_id=candidate_id, legs=legs)
+    _validate_changes(spending_changes)
+    scenario, excluded = _scenario_for_legs(
+        baseline,
+        candidate_id=candidate_id,
+        legs=legs,
+        scenario_adjustments=scenario_adjustments,
+    )
     if scenario.blockers or scenario.minimum_balance_violated:
         return None
     return PlanCandidate(
         candidate_id=candidate_id,
         method=method,
         payment_legs=legs,
-        spending_changes=(),
+        spending_changes=spending_changes,
         payment_option_id=payment_option_id,
         start_date=legs[0].payment_date,
         completion_date=legs[-1].payment_date,
@@ -235,13 +298,74 @@ def _safe_candidate(
     )
 
 
+def _change_with_amount(change: SpendingChange, amount: Decimal) -> SpendingChange:
+    return SpendingChange(change.action, change.event_id, amount, change.category, change.provenance)
+
+
+def derive_least_reduced_changes(
+    dataset: Dataset,
+    baseline: ForecastResult,
+    legs: tuple[PaymentLeg, ...],
+    changes: tuple[SpendingChange, ...],
+    *,
+    candidate_id: str,
+) -> tuple[SpendingChange, ...] | None:
+    """Find largest safe targets, i.e. the least Decimal reductions, by search."""
+    reduce_changes = tuple(change for change in changes if change.action == "reduce_to")
+    if not reduce_changes:
+        return changes
+
+    def safe(candidate_changes: tuple[SpendingChange, ...]) -> bool:
+        adjustments = bind_scenario_adjustments(dataset, baseline, candidate_changes)
+        if adjustments is None:
+            return False
+        scenario, _ = _scenario_for_legs(
+            baseline,
+            candidate_id=candidate_id,
+            legs=legs,
+            scenario_adjustments=adjustments,
+        )
+        return not scenario.blockers and not scenario.minimum_balance_violated
+
+    targets = {change.event_id: change.new_amount for change in reduce_changes}
+    if not safe(changes):
+        return None
+    for change in reduce_changes:
+        event = dataset.indexes.events_by_event_id[change.event_id]
+        assert change.new_amount is not None and event.amount is not None
+        minimum = change.new_amount
+        maximum = event.amount
+        scale = min(minimum.as_tuple().exponent, maximum.as_tuple().exponent)
+        step = Decimal("1").scaleb(scale)
+        low = int((minimum / step).to_integral_exact())
+        high = int((maximum / step).to_integral_exact())
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            target = Decimal(midpoint) * step
+            trial = tuple(
+                _change_with_amount(item, target) if item.event_id == change.event_id else _change_with_amount(item, targets[item.event_id])
+                if item.action == "reduce_to" else item
+                for item in changes
+            )
+            if safe(trial):
+                low = midpoint
+                targets[change.event_id] = target
+            else:
+                high = midpoint - 1
+    return tuple(
+        _change_with_amount(item, targets[item.event_id]) if item.action == "reduce_to" else item
+        for item in changes
+    )
+
+
 def _deduplicate(candidates: list[PlanCandidate]) -> tuple[PlanCandidate, ...]:
-    unique: dict[tuple[str, str | None, tuple[tuple[date, Decimal], ...]], PlanCandidate] = {}
+    unique: dict[tuple[str, str | None, tuple[tuple[date, Decimal], ...], tuple[tuple[str, str, Decimal | None], ...]], PlanCandidate] = {}
     for candidate in candidates:
         key = (
             candidate.method,
             candidate.payment_option_id,
             tuple((leg.payment_date, leg.amount) for leg in candidate.payment_legs),
+            tuple((change.action, change.event_id, change.new_amount) for change in candidate.spending_changes),
         )
         unique.setdefault(key, candidate)
     return tuple(sorted(unique.values(), key=lambda item: (item.method, item.payment_option_id or "", item.candidate_id)))
@@ -262,16 +386,22 @@ def generate_plan_candidates(
 
     profile = dataset.indexes.profiles_by_user_id[request.user_id]
     candidates: list[PlanCandidate] = []
+    schedule_specs: list[tuple[str, str, tuple[PaymentLeg, ...], str | None, tuple[PlanTrace, ...]]] = []
     traces: list[PlanTrace] = [
         PlanTrace("l4_capacity_input", "Used supplied Level 4 baseline capacity; did not recompute it.", (capacity.request_id,)),
     ]
 
     if _method_allowed("full_payment", profile.payment_methods_user_will_consider):
+        full_legs = (PaymentLeg(request.request_date, request.requested_amount, (request.request_id, "full_now")),)
+        schedule_specs.append((
+            "full_now", "full_payment", full_legs, None,
+            (PlanTrace("full_now", "One full requested-amount payment on the request date.", (request.request_id,)),),
+        ))
         candidate = _safe_candidate(
             request=request,
             candidate_id="full_now",
             method="full_payment",
-            legs=(PaymentLeg(request.request_date, request.requested_amount, (request.request_id, "full_now")),),
+            legs=full_legs,
             payment_option_id=None,
             baseline=baseline,
             traces=(PlanTrace("full_now", "One full requested-amount payment on the request date.", (request.request_id,)),),
@@ -292,6 +422,10 @@ def generate_plan_candidates(
             PaymentLeg(request.request_date, first, (request.request_id, "partial:first")),
             PaymentLeg(capacity.earliest_date_for_full_payment, second, (request.request_id, "partial:remaining")),
         )
+        schedule_specs.append((
+            "partial", "partial_payment", legs, None,
+            (PlanTrace("partial_documented_gates", "All documented partial-payment gates passed.", (request.request_id,)),),
+        ))
         candidate = _safe_candidate(
             request=request,
             candidate_id="partial",
@@ -309,6 +443,10 @@ def generate_plan_candidates(
             if option.payment_method != "installments" or option.number_of_payments > profile.max_installment_months:
                 continue
             legs = installment_legs(option)
+            schedule_specs.append((
+                f"installments:{option.payment_option_id}", "installments", legs, option.payment_option_id,
+                (PlanTrace("supplied_installment_option", "Used the documented option schedule unchanged.", (option.payment_option_id,)),),
+            ))
             candidate = _safe_candidate(
                 request=request,
                 candidate_id=f"installments:{option.payment_option_id}",
@@ -326,17 +464,22 @@ def generate_plan_candidates(
         and capacity.earliest_date_for_full_payment is not None
         and capacity.earliest_date_for_full_payment > request.request_date
     ):
+        wait_legs = (
+            PaymentLeg(
+                capacity.earliest_date_for_full_payment,
+                request.requested_amount,
+                (request.request_id, "wait_until_l4_earliest_full_date"),
+            ),
+        )
+        schedule_specs.append((
+            "wait", "wait", wait_legs, None,
+            (PlanTrace("wait_at_l4_earliest_full_date", "Waited exactly until the supplied L4 earliest full-payment date.", (request.request_id,)),),
+        ))
         candidate = _safe_candidate(
             request=request,
             candidate_id="wait",
             method="wait",
-            legs=(
-                PaymentLeg(
-                    capacity.earliest_date_for_full_payment,
-                    request.requested_amount,
-                    (request.request_id, "wait_until_l4_earliest_full_date"),
-                ),
-            ),
+            legs=wait_legs,
             payment_option_id=None,
             baseline=baseline,
             traces=(PlanTrace("wait_at_l4_earliest_full_date", "Waited exactly until the supplied L4 earliest full-payment date.", (request.request_id,)),),
@@ -344,13 +487,45 @@ def generate_plan_candidates(
         if candidate is not None:
             candidates.append(candidate)
 
-    deferred_changes = eligible_spending_changes(dataset, request, recurring_series)
-    if deferred_changes:
+    eligible_changes = eligible_spending_changes(dataset, request, recurring_series)
+    for change_set in bounded_change_sets(eligible_changes)[1:]:
+        for spec_id, method, legs, option_id, spec_traces in schedule_specs:
+            derived = derive_least_reduced_changes(
+                dataset,
+                baseline,
+                legs,
+                change_set,
+                candidate_id=f"{spec_id}:changes",
+            )
+            if derived is None:
+                continue
+            adjustments = bind_scenario_adjustments(dataset, baseline, derived)
+            if adjustments is None:
+                continue
+            change_key = "+".join(f"{item.action}:{item.event_id}" for item in derived)
+            candidate = _safe_candidate(
+                request=request,
+                candidate_id=f"{spec_id}:changes:{change_key}",
+                method=method,
+                legs=legs,
+                payment_option_id=option_id,
+                baseline=baseline,
+                spending_changes=derived,
+                scenario_adjustments=adjustments,
+                traces=spec_traces + (
+                    PlanTrace("l3_spending_change_scenario", "Validated permitted flexible recurring changes against L3.", tuple(item.event_id for item in derived)),
+                ),
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    deferred_changes = ()
+    if eligible_changes:
         traces.append(
             PlanTrace(
-                "spending_changes_deferred",
-                "Eligible recurring flexible changes were not emitted because L3 scenarios cannot suppress or amend baseline movements.",
-                tuple(change.event_id for change in deferred_changes),
+                "spending_changes_considered",
+                "Bounded permitted flexible recurring change sets were validated with L3 scenario adjustments.",
+                tuple(change.event_id for change in eligible_changes),
             )
         )
 

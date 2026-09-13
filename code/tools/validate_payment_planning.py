@@ -175,9 +175,27 @@ class PaymentPlanningTests(unittest.TestCase):
         dataset, active_request, series, _baseline, _capacity = planning_context(events=events, profile_row=active_profile)
         changes = eligible_spending_changes(dataset, active_request, series)
         self.assertEqual([(change.action, change.event_id) for change in changes], [
-            ("reduce_to", "dining_1"), ("stop", "dining_1"), ("reduce_to", "dining_2"),
-            ("stop", "dining_2"), ("reduce_to", "dining_3"), ("stop", "dining_3"),
+            ("reduce_to", "dining_3"), ("stop", "dining_3"),
         ])
+
+    def test_valid_stop_change_can_make_an_unsafe_full_payment_safe(self) -> None:
+        active_profile = planning_profile(payment_methods=("full_payment",), stop=("dining",))
+        active_profile = replace(active_profile, current_available_balance=Decimal("200"), minimum_balance_to_keep=Decimal("100"))
+        active_request = replace(request(requested=Decimal("100")), request_date=date(2026, 4, 1))
+        events = (
+            event("dining_1", amount=Decimal("100"), category="dining", description="Dinner plan", flexibility="stoppable", event_date=date(2026, 1, 1)),
+            event("dining_2", amount=Decimal("100"), category="dining", description="Dinner plan", flexibility="stoppable", event_date=date(2026, 2, 1)),
+            event("dining_3", amount=Decimal("100"), category="dining", description="Dinner plan", flexibility="stoppable", event_date=date(2026, 3, 1)),
+        )
+        dataset, active_request, series, baseline, capacity = planning_context(
+            events=events, profile_row=active_profile, request_row=active_request
+        )
+        result = generate_plan_candidates(dataset, active_request, capacity, baseline, series)
+        changed = [candidate for candidate in result.candidates if candidate.spending_changes]
+        self.assertFalse(any(not candidate.spending_changes and candidate.method == "full_payment" for candidate in result.candidates))
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].spending_changes[0].action, "stop")
+        self.assertEqual(changed[0].spending_changes[0].event_id, "dining_3")
 
     def test_bounded_change_sets_are_deterministic_and_never_exceed_three(self) -> None:
         changes = tuple(SpendingChange("stop", f"event_{index}", None, "dining", (f"event_{index}",)) for index in range(8))
@@ -210,7 +228,7 @@ def print_sample_diagnostics() -> None:
         for method in ("full_payment", "partial_payment", "installments", "wait"):
             if method in methods:
                 counts[method].append(request_row.request_id)
-        if result.deferred_spending_changes:
+        if any(candidate.spending_changes for candidate in result.candidates):
             counts["spending_changes"].append(request_row.request_id)
         if not result.candidates:
             counts["zero"].append(request_row.request_id)
