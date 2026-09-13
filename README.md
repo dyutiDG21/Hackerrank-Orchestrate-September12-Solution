@@ -132,6 +132,18 @@ Your solution must:
 
 If you use API keys or secrets, read them from environment variables. Never hardcode secrets in the repo.
 
+## Final Run
+
+Requires Python 3.11+ and only the standard library. Supply `OPENAI_API_KEY` through the process environment when evidence cache misses must be extracted; do not put secrets in source code.
+
+Run the final pipeline with:
+
+```bash
+python code/main.py --run-real-api
+```
+
+It reuses `.cache/evidence_extraction`, fills only cache misses, writes root `output.csv`, and writes `code/evaluation/usage_report.md`. To inspect whether evidence is complete without provider calls, run `python code/main.py`; it prints cache inventory and a safe rerun command. Validation suites live under `code/tools/`.
+
 ---
 
 ## Evaluation
