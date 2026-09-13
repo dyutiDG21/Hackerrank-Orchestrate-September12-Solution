@@ -56,6 +56,10 @@ class EvidenceValidationError(DataValidationError):
     """Raised when extracted evidence is malformed or outside the allowed schema."""
 
 
+class ClaimValidationError(EvidenceValidationError):
+    """Raised when one extracted claim is unusable but the response can continue."""
+
+
 @dataclass(frozen=True)
 class EvidenceClaim:
     claim_id: str
@@ -175,9 +179,9 @@ def validate_claim(
     amount = parse_optional_decimal(raw_claim.get("amount"), "amount")
     currency = optional_text(raw_claim.get("currency"), "currency")
     if amount is None and currency is not None:
-        raise EvidenceValidationError("currency cannot be present when amount is null")
+        raise ClaimValidationError("currency cannot be present when amount is null")
     if amount is not None and currency is None:
-        raise EvidenceValidationError("currency is required when amount is present")
+        raise ClaimValidationError("currency is required when amount is present")
     return EvidenceClaim(
         claim_id=required_text(raw_claim.get("claim_id"), "claim_id"),
         source_type=source_type,
@@ -264,17 +268,22 @@ def validate_evidence_response(
     raw_claims = response.get("claims")
     if not isinstance(raw_claims, list):
         raise EvidenceValidationError("claims must be a list")
-    claims = cleanup_claims(tuple(
-        validate_claim(
-            claim,
-            source_type=source_type,
-            source_id=source_id,
-            user_id=user_id,
-            request_id=request_id,
-            related_event_id=related_event_id,
-        )
-        for claim in raw_claims
-    ))
+    valid_claims: list[EvidenceClaim] = []
+    for claim in raw_claims:
+        try:
+            valid_claims.append(
+                validate_claim(
+                    claim,
+                    source_type=source_type,
+                    source_id=source_id,
+                    user_id=user_id,
+                    request_id=request_id,
+                    related_event_id=related_event_id,
+                )
+            )
+        except ClaimValidationError:
+            continue
+    claims = cleanup_claims(tuple(valid_claims))
     return EvidenceExtractionResult(
         source_type=source_type,
         source_id=source_id,

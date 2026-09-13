@@ -508,6 +508,73 @@ class EvidenceExtractionTests(unittest.TestCase):
                 related_event_id=None,
             )
 
+    def test_amount_without_currency_claim_is_dropped(self) -> None:
+        result = validate_evidence_response(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "claims": [
+                    {
+                        "claim_id": "percent_only",
+                        "claim_type": "amount_amendment",
+                        "document_role": None,
+                        "amount": "12",
+                        "currency": None,
+                        "effective_date": None,
+                        "status": None,
+                        "identifier_role": None,
+                        "referenced_external_id": "SER-0012",
+                        "provenance": "Message states rent increased by 12%.",
+                    },
+                    {
+                        "claim_id": "date_valid",
+                        "claim_type": "date_confirmation",
+                        "document_role": None,
+                        "amount": None,
+                        "currency": None,
+                        "effective_date": "2023-08-16",
+                        "status": "confirmed",
+                        "identifier_role": None,
+                        "referenced_external_id": "SER-0012",
+                        "provenance": "Message says the new amount applies to the next rent payment.",
+                    },
+                ],
+            },
+            source_type="message",
+            source_id="message_12",
+            user_id="user_16",
+            request_id="request_16",
+            related_event_id=None,
+        )
+        self.assertEqual([claim.claim_id for claim in result.claims], ["date_valid"])
+        self.assertIsNone(result.claims[0].amount)
+
+    def test_usage_recorded_when_response_validation_fails(self) -> None:
+        message = self.dataset.indexes.messages_by_message_id["message_01"]
+        fake = FakeEvidenceClient(
+            [
+                ProviderResponse(
+                    payload={"schema_version": "unsupported", "claims": []},
+                    input_tokens=10,
+                    output_tokens=2,
+                    cached_input_tokens=1,
+                )
+            ]
+        )
+        usage = UsageTracker()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(EvidenceValidationError):
+                extract_message_evidence(
+                    message,
+                    client=fake,
+                    config=EvidenceExtractionConfig(cache_dir=Path(tmp)),
+                    cache=EvidenceCache(tmp),
+                    usage_tracker=usage,
+                )
+        self.assertEqual(usage.totals()["calls"], 1)
+        self.assertEqual(usage.totals()["input_tokens"], 10)
+        self.assertEqual(usage.totals()["output_tokens"], 2)
+        self.assertEqual(usage.totals()["cached_input_tokens"], 1)
+
     def test_prompt_injection_like_source_content_remains_inert_data(self) -> None:
         message = self.dataset.indexes.messages_by_message_id["message_01"]
         malicious_source = source_from_message(message)

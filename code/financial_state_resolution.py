@@ -17,6 +17,8 @@ from data_layer import Dataset, FinancialEvent
 from event_normalization import NormalizedCashEvent, build_linked_child_ids, normalize_event
 from evidence_schema import EvidenceClaim
 
+CASH_STATUSES = {"settled", "pending", "scheduled", "failed", "cancelled", "unrealized"}
+
 
 @dataclass(frozen=True)
 class ResolutionTrace:
@@ -136,6 +138,13 @@ def field_source_rank(claim: EvidenceClaim) -> tuple[str, str, str]:
     return claim_order_key(claim)
 
 
+def canonical_cash_status(status: str) -> str | None:
+    normalized = status.strip().lower()
+    if normalized in CASH_STATUSES:
+        return normalized
+    return None
+
+
 def is_amount_claim(claim: EvidenceClaim) -> bool:
     return claim.amount is not None and claim.currency is not None and claim.claim_type in {
         "missing_amount",
@@ -146,6 +155,25 @@ def is_amount_claim(claim: EvidenceClaim) -> bool:
         "pending_payment_clarification",
         "future_payment_clarification",
     }
+
+
+def event_represents_outstanding_balance(event: FinancialEvent) -> bool:
+    text = event.description.lower()
+    words = set(text.replace("/", " ").replace("-", " ").split())
+    if "outstanding" in words and "balance" in words:
+        return True
+    if "remaining" in words and ({"amount", "balance"} & words):
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "outstanding balance",
+            "balance due",
+            "remaining amount",
+            "remaining balance",
+            "amount due",
+        )
+    )
 
 
 def amount_role_score(event: FinancialEvent, claim: EvidenceClaim) -> int:
@@ -165,6 +193,11 @@ def amount_role_score(event: FinancialEvent, claim: EvidenceClaim) -> int:
         if role in {"total_amount", "total_earnings"}:
             return 50
     if event.direction == "debit":
+        if event_represents_outstanding_balance(event):
+            if role in {"balance_due", "outstanding_amount"}:
+                return 120
+            if role == "total_amount":
+                return 70
         if event.status == "settled" and role in {"amount_paid", "amount_received", "transferred_amount"}:
             return 100
         if event.status in {"pending", "scheduled"} and role in {"balance_due", "outstanding_amount", "total_amount"}:
@@ -245,17 +278,41 @@ def apply_evidence_to_event(
 
     status_claims = [claim for claim in sorted_claims if claim.status and claim.claim_type in {"status_confirmation", "cancellation", "invalidation"}]
     if status_claims:
-        claim = status_claims[-1]
-        status = "cancelled" if claim.claim_type in {"cancellation", "invalidation"} else claim.status
-        current = apply_field_update(
-            current,
-            traces,
-            field="status",
-            value=status,
-            claim=claim,
-            rule="explicit_status_or_cancellation",
-            reason="Applied explicit status, cancellation, or invalidation claim.",
-        )
+        applicable_statuses: list[tuple[EvidenceClaim, str, str, str]] = []
+        for claim in status_claims:
+            if claim.claim_type in {"cancellation", "invalidation"}:
+                applicable_statuses.append(
+                    (
+                        claim,
+                        "cancelled",
+                        "explicit_status_or_cancellation",
+                        "Applied explicit cancellation or invalidation claim.",
+                    )
+                )
+                continue
+            status = canonical_cash_status(claim.status or "")
+            if status is None:
+                unresolved.append(UnresolvedEvidence(claim, "non_cash_lifecycle_status_not_applied"))
+                continue
+            applicable_statuses.append(
+                (
+                    claim,
+                    status,
+                    "explicit_financial_cash_status",
+                    "Applied explicit financial cash status claim.",
+                )
+            )
+        if applicable_statuses:
+            claim, status, rule, reason = applicable_statuses[-1]
+            current = apply_field_update(
+                current,
+                traces,
+                field="status",
+                value=status,
+                claim=claim,
+                rule=rule,
+                reason=reason,
+            )
 
     date_claims = [claim for claim in sorted_claims if claim.effective_date is not None and claim.claim_type in {"date_confirmation", "date_amendment", "status_confirmation", "amount_amendment"}]
     if date_claims:

@@ -64,6 +64,7 @@ def event(
     category: str = "rent",
     description: str = "Monthly rent",
     linked_event_id: str | None = None,
+    flexibility: str = "fixed",
 ) -> FinancialEvent:
     cash_date = settlement_date or event_date
     return FinancialEvent(
@@ -79,7 +80,7 @@ def event(
         settlement_date=cash_date,
         status=status,
         linked_event_id=linked_event_id,
-        flexibility="fixed",
+        flexibility=flexibility,
         minimum_allowed_amount=None,
         raw={},
     )
@@ -313,6 +314,51 @@ class FinancialForecastTests(unittest.TestCase):
         ), profile_row=low_profile)
         self.assertEqual([movement.direction for movement in result.movements], ["debit", "credit"])
         self.assertTrue(result.minimum_balance_violated)
+
+    def test_same_day_confirmed_salary_precedes_hypothetical_payment(self) -> None:
+        low_profile = profile(balance=Decimal("100"), minimum=Decimal("50"))
+        baseline = forecast_for((
+            event("event_1", amount=Decimal("100"), direction="credit", event_type="income", category="salary", event_date=date(2026, 1, 1)),
+        ), profile_row=low_profile)
+        scenario = build_scenario_forecast(
+            baseline,
+            hypothetical_movements=(HypotheticalMovement("request_payment", date(2026, 1, 1), Decimal("150")),),
+        )
+        self.assertEqual([movement.source for movement in scenario.movements], ["explicit_event", "hypothetical"])
+        self.assertFalse(scenario.minimum_balance_violated)
+
+    def test_same_day_projected_salary_precedes_hypothetical_payment(self) -> None:
+        low_profile = profile(balance=Decimal("100"), minimum=Decimal("50"))
+        baseline = forecast_for((
+            salary_event("event_1", date(2026, 1, 1), amount=Decimal("100")),
+            salary_event("event_2", date(2026, 2, 1), amount=Decimal("100")),
+            salary_event("event_3", date(2026, 3, 1), amount=Decimal("100")),
+        ), start=date(2026, 4, 1), horizon_days=1, profile_row=low_profile)
+        scenario = build_scenario_forecast(
+            baseline,
+            hypothetical_movements=(HypotheticalMovement("request_payment", date(2026, 4, 1), Decimal("150")),),
+        )
+        self.assertEqual([movement.source for movement in scenario.movements], ["recurrence_projection", "hypothetical"])
+        self.assertFalse(scenario.minimum_balance_violated)
+
+    def test_same_day_non_salary_credit_stays_after_hypothetical_payment(self) -> None:
+        low_profile = profile(balance=Decimal("100"), minimum=Decimal("50"))
+        baseline = forecast_for((
+            event(
+                "event_1",
+                amount=Decimal("100"),
+                direction="credit",
+                event_type="income",
+                category="bonus",
+                event_date=date(2026, 1, 1),
+            ),
+        ), profile_row=low_profile)
+        scenario = build_scenario_forecast(
+            baseline,
+            hypothetical_movements=(HypotheticalMovement("request_payment", date(2026, 1, 1), Decimal("100")),),
+        )
+        self.assertEqual([movement.source for movement in scenario.movements], ["hypothetical", "explicit_event"])
+        self.assertTrue(scenario.minimum_balance_violated)
 
     def test_hypothetical_scenario_debit(self) -> None:
         baseline = forecast_for(())

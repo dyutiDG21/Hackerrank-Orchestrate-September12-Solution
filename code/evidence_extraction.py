@@ -237,8 +237,6 @@ def extract_evidence_for_source(
 
     prompt = build_extraction_prompt(source)
     provider_response = client.extract_structured_claims(source, prompt, evidence_response_json_schema())
-    result = validate_for_source(provider_response.payload, source)
-    active_cache.put(key, result_to_jsonable(result))
     if usage_tracker is not None:
         usage_tracker.record(
             UsageRecord(
@@ -252,6 +250,8 @@ def extract_evidence_for_source(
                 cached_input_tokens=provider_response.cached_input_tokens,
             )
         )
+    result = validate_for_source(provider_response.payload, source)
+    active_cache.put(key, result_to_jsonable(result))
     return result
 
 

@@ -112,13 +112,29 @@ def signed_amount(amount: Decimal, direction: str) -> Decimal:
     raise ValueError(f"Unsupported forecast direction: {direction!r}")
 
 
+def is_confirmed_income_credit(movement: ForecastMovement) -> bool:
+    return (
+        movement.direction == "credit"
+        and movement.event_type == "income"
+        and movement.category == "salary"
+        and movement.source in {"explicit_event", "recurrence_projection"}
+        and movement.status in {"settled", "scheduled", "projected"}
+    )
+
+
 def movement_sort_key(movement: ForecastMovement) -> tuple[date, int, str, str]:
-    if movement.signed_amount < 0:
+    if movement.source == "pending_debit_reservation":
         direction_rank = 0
-    elif movement.signed_amount == 0:
+    elif movement.direction == "debit" and movement.source != "hypothetical":
         direction_rank = 1
-    else:
+    elif is_confirmed_income_credit(movement):
         direction_rank = 2
+    elif movement.source == "hypothetical":
+        direction_rank = 3
+    elif movement.direction == "credit":
+        direction_rank = 4
+    else:
+        direction_rank = 5
     source_rank = {
         "pending_debit_reservation": 0,
         "hypothetical": 1,

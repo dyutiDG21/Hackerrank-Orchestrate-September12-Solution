@@ -54,6 +54,7 @@ def event(
     direction: str = "debit",
     event_type: str = "expense",
     category: str = "rent",
+    description: str | None = None,
     linked_event_id: str | None = None,
     user_id: str = "user_test",
 ) -> FinancialEvent:
@@ -61,7 +62,7 @@ def event(
         event_id=event_id,
         user_id=user_id,
         event_type=event_type,
-        description=f"Synthetic {event_id}",
+        description=description or f"Synthetic {event_id}",
         category=category,
         direction=direction,
         amount=amount,
@@ -160,6 +161,33 @@ class FinancialStateResolutionTests(unittest.TestCase):
         state = resolve_financial_state(dataset_with((base,)), (older, newer))
         self.assertEqual(state.by_event_id["event_1"].resolved_event.status, "settled")
 
+    def test_non_cash_lifecycle_status_does_not_overwrite_financial_status(self) -> None:
+        base = event("event_1", status="settled", direction="debit", category="groceries", description="Delivered grocery order")
+        delivered = claim(
+            "claim_1",
+            claim_type="status_confirmation",
+            amount=None,
+            currency=None,
+            status="Delivered",
+            source_id="image_1",
+        )
+        state = resolve_financial_state(dataset_with((base,)), (delivered,))
+        self.assertEqual(state.by_event_id["event_1"].resolved_event.status, "settled")
+        self.assertEqual(state.unresolved_evidence[0].reason, "non_cash_lifecycle_status_not_applied")
+
+    def test_case_insensitive_financial_status_can_overwrite_financial_status(self) -> None:
+        base = event("event_1", status="pending")
+        settled = claim(
+            "claim_1",
+            claim_type="status_confirmation",
+            amount=None,
+            currency=None,
+            status="Settled",
+            source_id="message_1",
+        )
+        state = resolve_financial_state(dataset_with((base,)), (settled,))
+        self.assertEqual(state.by_event_id["event_1"].resolved_event.status, "settled")
+
     def test_field_level_amendment_preserves_unrelated_fields(self) -> None:
         base = event("event_1", amount=Decimal("100"), category="utilities", status="scheduled")
         amount_claim = claim("claim_1", amount=Decimal("125"), currency="USD")
@@ -196,6 +224,23 @@ class FinancialStateResolutionTests(unittest.TestCase):
         state = resolve_financial_state(dataset_with((base,), home_currency="INR"), claims)
         self.assertEqual(state.by_event_id["event_1"].resolved_event.amount, Decimal("200000"))
         self.assertIn("conservative", state.by_event_id["event_1"].traces[0].rule)
+
+    def test_outstanding_balance_debit_prefers_balance_due_role(self) -> None:
+        base = event(
+            "event_1",
+            amount=None,
+            direction="debit",
+            status="scheduled",
+            description="Outstanding rent balance",
+        )
+        claims = (
+            claim("total", document_role="total_amount", amount=Decimal("200000"), currency="INR"),
+            claim("received", document_role="amount_received", amount=Decimal("100000"), currency="INR"),
+            claim("balance", document_role="balance_due", amount=Decimal("100000"), currency="INR"),
+        )
+        state = resolve_financial_state(dataset_with((base,), home_currency="INR"), claims)
+        self.assertEqual(state.by_event_id["event_1"].resolved_event.amount, Decimal("100000"))
+        self.assertEqual(state.by_event_id["event_1"].traces[0].rule, "role_specific_amount_resolution")
 
     def test_unrelated_image_line_items_not_applied(self) -> None:
         base = event("event_1", amount=None, direction="debit", status="scheduled")
