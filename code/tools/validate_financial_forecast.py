@@ -297,6 +297,37 @@ class FinancialForecastTests(unittest.TestCase):
         self.assertIn("explicit_event:event_4", [movement.movement_id for movement in result.movements])
         self.assertIn(date(2026, 5, 1), [movement.date for movement in result.movements if movement.source == "recurrence_projection"])
 
+    def test_explicit_salary_suppresses_unique_projected_cycle_despite_changed_amount(self) -> None:
+        result = forecast_for((
+            salary_event("salary_1", date(2026, 1, 1), amount=Decimal("100")),
+            salary_event("salary_2", date(2026, 2, 1), amount=Decimal("100")),
+            salary_event("salary_3", date(2026, 3, 1), amount=Decimal("100")),
+            event("explicit_salary", amount=Decimal("150"), direction="credit", event_type="income", category="salary", description="Payroll adjustment", event_date=date(2026, 4, 1)),
+        ), start=date(2026, 4, 1), horizon_days=1)
+        credits = [movement for movement in result.movements if movement.direction == "credit"]
+        self.assertEqual([(movement.source, movement.amount) for movement in credits], [("explicit_event", Decimal("150"))])
+        self.assertEqual(result.notices[0].reason, "recurrence_projection_suppressed_by_explicit_salary")
+        self.assertIn("explicit_salary", result.notices[0].detail)
+
+    def test_distinct_salary_series_same_cycle_are_not_suppressed(self) -> None:
+        result = forecast_for((
+            event("a1", amount=Decimal("100"), direction="credit", event_type="income", category="salary", description="Employer A", event_date=date(2026, 1, 1)),
+            event("a2", amount=Decimal("100"), direction="credit", event_type="income", category="salary", description="Employer A", event_date=date(2026, 2, 1)),
+            event("a3", amount=Decimal("100"), direction="credit", event_type="income", category="salary", description="Employer A", event_date=date(2026, 3, 1)),
+            event("b1", amount=Decimal("50"), direction="credit", event_type="income", category="salary", description="Employer B", event_date=date(2026, 1, 1)),
+            event("b2", amount=Decimal("50"), direction="credit", event_type="income", category="salary", description="Employer B", event_date=date(2026, 2, 1)),
+            event("b3", amount=Decimal("50"), direction="credit", event_type="income", category="salary", description="Employer B", event_date=date(2026, 3, 1)),
+            event("manual", amount=Decimal("75"), direction="credit", event_type="income", category="salary", description="Manual payroll", event_date=date(2026, 4, 1)),
+        ), start=date(2026, 4, 1), horizon_days=1)
+        self.assertEqual(len([movement for movement in result.movements if movement.source == "recurrence_projection"]), 2)
+
+    def test_explicit_salary_in_another_cycle_does_not_suppress_projection(self) -> None:
+        result = forecast_for((
+            salary_event("salary_1", date(2026, 1, 1)), salary_event("salary_2", date(2026, 2, 1)), salary_event("salary_3", date(2026, 3, 1)),
+            event("manual", direction="credit", event_type="income", category="salary", description="Manual payroll", event_date=date(2026, 4, 2)),
+        ), start=date(2026, 4, 1), horizon_days=1)
+        self.assertEqual(len([movement for movement in result.movements if movement.source == "recurrence_projection"]), 1)
+
     def test_unrelated_explicit_event_does_not_suppress_recurrence(self) -> None:
         result = forecast_for((
             event("event_1", event_date=date(2026, 1, 1), description="Rent"),

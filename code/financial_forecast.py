@@ -422,6 +422,46 @@ def series_occurrence_key(series: RecurringSeries, occurrence_date: date) -> tup
     return (key.user_id, key.direction, key.event_type, key.category, key.description_key, key.currency, occurrence_date)
 
 
+def is_salary_income_series(series: RecurringSeries) -> bool:
+    key = series.grouping_key
+    return key.direction == "credit" and key.event_type == "income" and key.category == "salary"
+
+
+def unique_salary_series_for_cycle(
+    series: tuple[RecurringSeries, ...],
+    *,
+    user_id: str,
+    currency: str,
+    occurrence_date: date,
+) -> RecurringSeries | None:
+    """Return the sole salary series whose cadence produces this exact cycle."""
+    matches = []
+    for item in series:
+        if not (item.projectable and item.grouping_key.user_id == user_id and item.grouping_key.currency == currency and is_salary_income_series(item)):
+            continue
+        if next_occurrence_after(item, occurrence_date - timedelta(days=1)) == occurrence_date:
+            matches.append(item)
+    return matches[0] if len(matches) == 1 else None
+
+
+def explicit_salary_events_by_cycle(resolved_state: ResolvedState, user_id: str) -> dict[tuple[date, str], tuple[str, ...]]:
+    grouped: dict[tuple[date, str], list[str]] = {}
+    for record in resolved_state.effective_events:
+        event = record.resolved_event
+        if not (
+            record.active
+            and event.user_id == user_id
+            and event.direction == "credit"
+            and event.event_type == "income"
+            and event.category == "salary"
+            and event.status in {"settled", "scheduled"}
+            and record.normalized_event.is_cash_flow_candidate
+        ):
+            continue
+        grouped.setdefault((record.normalized_event.cash_date, event.currency), []).append(event.event_id)
+    return {key: tuple(sorted(value)) for key, value in grouped.items()}
+
+
 def convert_projection_amount(
     *,
     amount: Decimal,
@@ -441,11 +481,13 @@ def recurrence_movements_for_user(
     user_id: str,
     start_date: date,
     end_date: date,
-) -> tuple[tuple[ForecastMovement, ...], tuple[ForecastBlocker, ...], int]:
+) -> tuple[tuple[ForecastMovement, ...], tuple[ForecastBlocker, ...], int, tuple[ForecastNotice, ...]]:
     profile = dataset.indexes.profiles_by_user_id[user_id]
     explicit_keys = explicit_keys_for_user(resolved_state, user_id)
+    explicit_salary_cycles = explicit_salary_events_by_cycle(resolved_state, user_id)
     movements: list[ForecastMovement] = []
     blockers: list[ForecastBlocker] = []
+    notices: list[ForecastNotice] = []
     suppressed = 0
 
     for item in sorted(series, key=lambda value: value.series_id):
@@ -455,6 +497,30 @@ def recurrence_movements_for_user(
         while occurrence_date <= end_date:
             if series_occurrence_key(item, occurrence_date) in explicit_keys:
                 suppressed += 1
+                occurrence_date = advance_occurrence(item, occurrence_date)
+                continue
+
+            explicit_salary_ids = explicit_salary_cycles.get((occurrence_date, item.grouping_key.currency), ())
+            if (
+                explicit_salary_ids
+                and is_salary_income_series(item)
+                and unique_salary_series_for_cycle(
+                    series,
+                    user_id=user_id,
+                    currency=item.grouping_key.currency,
+                    occurrence_date=occurrence_date,
+                ) == item
+            ):
+                suppressed += 1
+                notices.append(
+                    ForecastNotice(
+                        "recurrence_projection_suppressed_by_explicit_salary",
+                        occurrence_date,
+                        "recurrence_series",
+                        item.series_id,
+                        f"Suppressed synthetic salary projection for exact cadence cycle represented by explicit event(s): {','.join(explicit_salary_ids)}.",
+                    )
+                )
                 occurrence_date = advance_occurrence(item, occurrence_date)
                 continue
 
@@ -522,7 +588,7 @@ def recurrence_movements_for_user(
             )
             occurrence_date = advance_occurrence(item, occurrence_date)
 
-    return tuple(movements), tuple(blockers), suppressed
+    return tuple(movements), tuple(blockers), suppressed, tuple(notices)
 
 
 def hypothetical_to_movement(user_id: str, home_currency: str, item: HypotheticalMovement) -> ForecastMovement:
@@ -564,7 +630,7 @@ def build_forecast(
         start_date=start_date,
         end_date=end_date,
     )
-    recurrence_movements, recurrence_blockers, suppressed = recurrence_movements_for_user(
+    recurrence_movements, recurrence_blockers, suppressed, recurrence_notices = recurrence_movements_for_user(
         dataset,
         resolved_state,
         recurring_series,
@@ -592,7 +658,7 @@ def build_forecast(
         minimum_balance_to_keep=profile.minimum_balance_to_keep,
         movements=explicit_movements + recurrence_movements + hypotheticals,
         blockers=explicit_blockers + recurrence_blockers,
-        notices=explicit_notices,
+        notices=explicit_notices + recurrence_notices,
         diagnostics=diagnostics,
     )
 
