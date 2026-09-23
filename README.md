@@ -12,7 +12,7 @@ Buy or Wait? is a hybrid AI financial reasoning system that reconstructs a
 person's financial state, forecasts near-term cash flow, and recommends safe
 ways to handle requested purchases.
 
-Originally built for HackerRank Orchestrate 2026 · Ranked 341st out of ~3,000 participants globally.
+Originally built for HackerRank Orchestrate 2026 · Ranked 357th out of ~3,000 participants globally.
 
 ## Why I Built It This Way
 
